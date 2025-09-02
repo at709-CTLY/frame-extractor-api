@@ -5,12 +5,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MAX_UPLOAD_MB=300 \
     CORS_ALLOW_ORIGINS=*
 
+# FFmpeg handles all MP4/MOV codecs reliably
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+    ffmpeg libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# deps
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+
+# app
 COPY main.py ./
 
 EXPOSE 8000
