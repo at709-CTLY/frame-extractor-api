@@ -1,5 +1,7 @@
 import os, tempfile, shutil, zipfile, subprocess, re
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from typing import Optional
+
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import FileResponse
 from starlette.background import BackgroundTask
@@ -17,6 +19,10 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True}
+
+# --------------------------
+# Helpers
+# --------------------------
 
 def _q_from_quality(quality: int) -> str:
     """
@@ -69,39 +75,121 @@ def _ffmpeg_extract(src_path: str, out_dir: str, every_s: int, start_s: int, end
 
     subprocess.check_call(args)
 
+def _download_youtube(youtube_url: str, dest_path: str):
+    """
+    Download a YouTube video to dest_path using yt-dlp.
+    Requires yt-dlp to be installed in the environment.
+    """
+    if not youtube_url:
+        raise HTTPException(status_code=400, detail="youtube_url is empty")
+
+    # Prefer mp4 if available; otherwise best available format
+    cmd = [
+        "yt-dlp",
+        "-f", "best[ext=mp4]/best",
+        "-o", dest_path,     # exact output path
+        "--quiet",
+        "--no-warnings",
+        youtube_url,
+    ]
+    try:
+        subprocess.check_call(cmd)
+    except FileNotFoundError:
+        # yt-dlp not installed
+        raise HTTPException(status_code=500, detail="yt-dlp is not installed on the server")
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=400, detail=f"yt-dlp failed: {e}")
+
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise HTTPException(status_code=400, detail="Failed to download YouTube video")
+
+# If you prefer pytube instead of yt-dlp, replace _download_youtube with:
+#
+# from pytube import YouTube
+# def _download_youtube(youtube_url: str, dest_path: str):
+#     yt = YouTube(youtube_url)
+#     stream = yt.streams.filter(progressive=True, file_extension='mp4').first() or yt.streams.first()
+#     if not stream:
+#         raise HTTPException(status_code=400, detail="No downloadable streams found")
+#     stream.download(filename=dest_path)
+
+# --------------------------
+# Main endpoint (accepts BOTH: multipart upload OR YouTube URL via form OR YouTube URL via JSON)
+# --------------------------
+
 @app.post("/extract_frames")
 async def extract_frames(
-    file: UploadFile = File(...),          # field name MUST be "file"
-    every_s: int = Form(1),                # 1 frame every N seconds
-    start_s: int = Form(0),                # optional trim start
-    end_s:   int = Form(0),                # optional trim end
-    fmt:     str = Form("jpg"),            # jpg|png|webp
-    quality: int = Form(95),               # 0..100
-    zip_name: str = Form("frames.zip"),    # returned filename
+    request: Request,
+    # Multipart/form-data fields (old behavior)
+    file: Optional[UploadFile] = File(None),   # field name "file"
+    every_s: int = Form(1),
+    start_s: int = Form(0),
+    end_s:   int = Form(0),
+    fmt:     str = Form("jpg"),
+    quality: int = Form(95),
+    zip_name: str = Form("frames.zip"),
+    youtube_url: Optional[str] = Form(None),   # support YouTube via form-data too
 ):
-    if file is None:
-        raise HTTPException(status_code=422, detail="file is required")
+    """
+    Accepts:
+      • Multipart upload with 'file' (previous behavior), or
+      • Multipart/form-data with 'youtube_url', or
+      • application/json with keys: youtube_url, interval_seconds, start_s, end_s, fmt, quality, zip_name
+    Returns:
+      • A ZIP of extracted frames.
+    """
+
+    # If neither 'file' nor 'youtube_url' were provided as form-data,
+    # check for application/json and parse it.
+    if not file and not youtube_url:
+        ct = request.headers.get("content-type", "")
+        if "application/json" in ct:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            youtube_url = data.get("youtube_url") or data.get("url")
+            # allow alternative key name for convenience
+            every_s   = int(data.get("interval_seconds", data.get("every_s", every_s)))
+            start_s   = int(data.get("start_s", start_s))
+            end_s     = int(data.get("end_s", end_s))
+            fmt       = (data.get("fmt") or fmt).lower()
+            quality   = int(data.get("quality", quality))
+            zip_name  = data.get("zip_name", zip_name)
+
+    # Validate fmt early
+    if (fmt or "").lower() not in ("jpg", "jpeg", "png", "webp"):
+        raise HTTPException(status_code=400, detail="fmt must be one of: jpg, png, webp")
 
     # temp workspace
     tmp_root = tempfile.mkdtemp(prefix="frames_")
-    src_path = os.path.join(tmp_root, file.filename or "input.bin")
     frames_dir = os.path.join(tmp_root, "frames")
     os.makedirs(frames_dir, exist_ok=True)
+    src_path = os.path.join(tmp_root, "input.mp4")
 
-    # save upload
-    try:
-        with open(src_path, "wb") as f:
-            f.write(await file.read())
-    except Exception as e:
+    def _cleanup():
         shutil.rmtree(tmp_root, ignore_errors=True)
-        raise HTTPException(status_code=400, detail=f"could not save upload: {e}")
 
-    # extract & zip
     try:
+        # Case 1: file upload (old path)
+        if file is not None:
+            with open(src_path, "wb") as f:
+                f.write(await file.read())
+
+        # Case 2: YouTube URL (form or JSON)
+        elif youtube_url:
+            _download_youtube(youtube_url, src_path)
+
+        else:
+            _cleanup()
+            raise HTTPException(status_code=422, detail="Either 'file' or 'youtube_url' is required")
+
+        # Extract & zip
         _ffmpeg_extract(src_path, frames_dir, every_s, start_s, end_s, fmt, quality)
 
         files = sorted(os.listdir(frames_dir))
         if not files:
+            _cleanup()
             raise HTTPException(status_code=500, detail="No frames produced")
 
         zip_path = os.path.join(tmp_root, _safe_zip_name(zip_name))
@@ -110,17 +198,20 @@ async def extract_frames(
                 full = os.path.join(frames_dir, name)
                 zf.write(full, arcname=name)
 
-        # return the zip and clean up temp dir afterwards
+        # Return the zip and clean up temp dir afterwards
         return FileResponse(
             zip_path,
             media_type="application/zip",
             filename=os.path.basename(zip_path),
-            background=BackgroundTask(lambda: shutil.rmtree(tmp_root, ignore_errors=True)),
+            background=BackgroundTask(_cleanup),
         )
 
     except subprocess.CalledProcessError as e:
-        shutil.rmtree(tmp_root, ignore_errors=True)
+        _cleanup()
         raise HTTPException(status_code=500, detail=f"ffmpeg failed: {e}") from e
-    except Exception:
-        shutil.rmtree(tmp_root, ignore_errors=True)
+    except HTTPException:
+        _cleanup()
         raise
+    except Exception as e:
+        _cleanup()
+        raise HTTPException(status_code=500, detail=str(e))
